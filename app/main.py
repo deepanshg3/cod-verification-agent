@@ -3,7 +3,7 @@ from typing import Optional
 
 import requests
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Query
 from pydantic import BaseModel, Field
 
 load_dotenv()
@@ -149,15 +149,50 @@ def health():
 # Tool 1: Get order
 # -------------------------------------------------------------------
 
-@app.get("/orders/{order_id}")
-def get_order(order_id: str):
+@app.get("/orders")
+def get_order_by_query(
+    order_id: str = Query(
+        ...,
+        description="The order ID associated with the current call.",
+    )
+):
     """
-    Retrieve the order that the Bolna agent is calling about.
+    Retrieve an order using a query parameter.
+
+    This endpoint is specifically convenient for Bolna custom
+    function calling because the order_id can be passed through
+    the function's param object.
     """
 
     order = supabase_get_order(order_id)
 
-    # Return only information the voice agent actually needs.
+    return {
+        "success": True,
+        "order": {
+            "order_id": order["order_id"],
+            "customer_name": order["customer_name"],
+            "product_name": order["product_name"],
+            "amount": float(order["amount"]),
+            "payment_method": order["payment_method"],
+            "address": order["address"],
+            "pincode": order["pincode"],
+            "landmark": order["landmark"],
+            "delivery_notes": order["delivery_notes"],
+            "verification_status": order["verification_status"],
+        },
+    }
+
+
+@app.get("/orders/{order_id}")
+def get_order(order_id: str):
+    """
+    Retrieve the order using the order ID in the URL path.
+
+    Kept for existing API clients and manual testing.
+    """
+
+    order = supabase_get_order(order_id)
+
     return {
         "success": True,
         "order": {
@@ -286,12 +321,6 @@ def update_order_verification(
                     "PENDING, VERIFIED, HOLD, CANCELLED"
                 ),
             )
-
-    payload["updated_at"] = "now()"
-
-    # PostgREST cannot evaluate now() when passed as a JSON string.
-    # Use the database timestamp generated automatically instead.
-    payload.pop("updated_at", None)
 
     updated = supabase_update_order(order_id, payload)
 
