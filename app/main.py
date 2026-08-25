@@ -294,7 +294,7 @@ def validate_address(request: AddressValidationRequest):
 # Tool 3: Update order verification
 # -------------------------------------------------------------------
 
-@app.patch("/orders/{order_id}/verification")
+@app.post("/orders/{order_id}/verification")
 def update_order_verification(
     order_id: str,
     request: OrderVerificationUpdate,
