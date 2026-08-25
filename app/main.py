@@ -383,6 +383,10 @@ def bolna_pre_call_webhook(payload: dict):
     authentication header. The actual order-reading and write
     endpoints remain protected by X-Tool-Secret.
     """
+    
+    print("=== BOLNA PRE-CALL PAYLOAD ===")
+    print(payload)
+    print("=== END BOLNA PRE-CALL PAYLOAD ===")
 
     # In Bolna execution records, the execution/call identifier may
     # appear as call_id or id depending on the payload surface.
