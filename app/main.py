@@ -330,6 +330,9 @@ class AddressValidationRequest(BaseModel):
 
 class OrderVerificationUpdate(BaseModel):
     model_config = ConfigDict(extra="forbid")
+    
+    call_id: str
+
 
     customer_confirmed: Optional[bool] = None
     address_verified: Optional[bool] = None
@@ -706,7 +709,6 @@ def validate_address(
 def update_order_verification(
     order_id: str,
     request: OrderVerificationUpdate,
-    call_id: str = Query(...),
     x_tool_secret: Optional[str] = Header(default=None),
 ):
     """
@@ -731,7 +733,7 @@ def update_order_verification(
     # ---------------------------------------------------------------
 
     verify_call_order_access(
-        call_id=call_id,
+        call_id=request.call_id,
         order_id=order_id,
     )
 
@@ -746,8 +748,10 @@ def update_order_verification(
         "CANCELLED",
     }
 
-    payload = request.model_dump(exclude_none=True)
-
+    payload = request.model_dump(
+        exclude_none=True,
+        exclude={"call_id"},
+    )
     # ---------------------------------------------------------------
     # Verification status validation
     # ---------------------------------------------------------------
