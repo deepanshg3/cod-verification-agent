@@ -1,10 +1,10 @@
 import os
 from typing import Optional
-
+from datetime import datetime, timezone
 import requests
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException, Query
-from pydantic import BaseModel, Field
+from fastapi import FastAPI, HTTPException, Query, Header
+from pydantic import BaseModel, Field, ConfigDict
 
 load_dotenv()
 
@@ -14,6 +14,7 @@ NOMINATIM_USER_AGENT = os.getenv(
     "NOMINATIM_USER_AGENT",
     "CODVerificationAgent/1.0"
 )
+TOOL_API_SECRET = os.getenv("TOOL_API_SECRET", "")
 
 if not SUPABASE_URL:
     raise RuntimeError("SUPABASE_URL is not configured")
@@ -21,12 +22,31 @@ if not SUPABASE_URL:
 if not SUPABASE_SERVICE_ROLE_KEY:
     raise RuntimeError("SUPABASE_SERVICE_ROLE_KEY is not configured")
 
+if not TOOL_API_SECRET:
+    raise RuntimeError("TOOL_API_SECRET is not configured")
+
 
 app = FastAPI(
     title="COD Order Verification API",
     description="Backend for a Bolna-powered pre-dispatch COD verification agent.",
     version="1.0.0",
 )
+
+
+# -------------------------------------------------------------------
+# Tool authentication
+# -------------------------------------------------------------------
+
+def verify_tool_secret(x_tool_secret: Optional[str]):
+    """
+    Authenticate requests coming from Bolna custom tools.
+    """
+
+    if not x_tool_secret or x_tool_secret != TOOL_API_SECRET:
+        raise HTTPException(
+            status_code=401,
+            detail="Unauthorized tool request",
+        )
 
 
 # -------------------------------------------------------------------
@@ -106,18 +126,147 @@ def supabase_update_order(order_id: str, payload: dict):
 
 
 # -------------------------------------------------------------------
+# Call session helpers
+# -------------------------------------------------------------------
+
+def supabase_get_call_session(call_id: str):
+    """
+    Retrieve the server-side session associated with a call.
+    """
+
+    url = f"{SUPABASE_URL}/rest/v1/call_sessions"
+
+    response = requests.get(
+        url,
+        headers=supabase_headers(),
+        params={
+            "call_id": f"eq.{call_id}",
+            "select": "*",
+            "limit": "1",
+        },
+        timeout=10,
+    )
+
+    if response.status_code != 200:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Supabase session error: {response.text}",
+        )
+
+    rows = response.json()
+
+    if not rows:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Call session {call_id} not found",
+        )
+
+    return rows[0]
+
+
+def supabase_create_call_session(call_id: str, order_id: str):
+    """
+    Create a server-side authorization binding between a call
+    and exactly one order.
+    """
+
+    url = f"{SUPABASE_URL}/rest/v1/call_sessions"
+
+    response = requests.post(
+        url,
+        headers={
+            **supabase_headers(),
+            "Prefer": "return=representation",
+        },
+        json={
+            "call_id": call_id,
+            "order_id": order_id,
+            "status": "ACTIVE",
+        },
+        timeout=10,
+    )
+
+    if response.status_code not in (200, 201):
+        raise HTTPException(
+            status_code=502,
+            detail=f"Supabase session creation error: {response.text}",
+        )
+
+    rows = response.json()
+
+    if not rows:
+        raise HTTPException(
+            status_code=502,
+            detail="Supabase did not return the created call session.",
+        )
+
+    return rows[0]
+
+
+def verify_call_order_access(call_id: str, order_id: str):
+    """
+    Verify that the requested order belongs to the active,
+    non-expired call session.
+    """
+
+    session = supabase_get_call_session(call_id)
+
+    if session["status"] != "ACTIVE":
+        raise HTTPException(
+            status_code=403,
+            detail="This call session is no longer active.",
+        )
+
+    expires_at = session.get("expires_at")
+
+    if expires_at:
+        try:
+            expires = datetime.fromisoformat(
+                expires_at.replace("Z", "+00:00")
+            )
+
+            if expires <= datetime.now(timezone.utc):
+                raise HTTPException(
+                    status_code=403,
+                    detail="This call session has expired.",
+                )
+
+        except ValueError:
+            raise HTTPException(
+                status_code=500,
+                detail="Invalid call session expiration timestamp.",
+            )
+
+    if session["order_id"] != order_id:
+        raise HTTPException(
+            status_code=403,
+            detail="Order is not authorized for this call session.",
+        )
+
+    return session
+
+# -------------------------------------------------------------------
 # Request models
 # -------------------------------------------------------------------
 
 class AddressValidationRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     address: str = Field(
         ...,
         min_length=3,
         description="Full address supplied or corrected by the customer.",
     )
 
+    pincode: Optional[str] = Field(
+        default=None,
+        description="Postal code supplied by the customer, if available.",
+    )
+
 
 class OrderVerificationUpdate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     customer_confirmed: Optional[bool] = None
     address_verified: Optional[bool] = None
     address: Optional[str] = None
@@ -142,7 +291,50 @@ def root():
 
 @app.get("/health")
 def health():
-    return {"status": "healthy"}
+    return {
+        "status": "healthy",
+    }
+
+
+# -------------------------------------------------------------------
+# Tool 0: Create call session
+# -------------------------------------------------------------------
+
+@app.post("/call-sessions")
+def create_call_session(
+    call_id: str = Query(
+        ...,
+        min_length=1,
+        description="Unique identifier for the current voice call.",
+    ),
+    order_id: str = Query(
+        ...,
+        min_length=1,
+        description="Order authorized for this call.",
+    ),
+    x_tool_secret: Optional[str] = Header(default=None),
+):
+    """
+    Create a server-side authorization binding between a call
+    and exactly one order.
+
+    This is currently also useful for local/manual testing.
+    """
+
+    verify_tool_secret(x_tool_secret)
+
+    # Confirm that the order exists before creating the binding.
+    supabase_get_order(order_id)
+
+    session = supabase_create_call_session(
+        call_id=call_id,
+        order_id=order_id,
+    )
+
+    return {
+        "success": True,
+        "session": session,
+    }
 
 
 # -------------------------------------------------------------------
@@ -154,15 +346,24 @@ def get_order_by_query(
     order_id: str = Query(
         ...,
         description="The order ID associated with the current call.",
-    )
+    ),
+    call_id: str = Query(
+        ...,
+        description="The server-side call session identifier.",
+    ),
+    x_tool_secret: Optional[str] = Header(default=None),
 ):
     """
-    Retrieve an order using a query parameter.
-
-    This endpoint is specifically convenient for Bolna custom
-    function calling because the order_id can be passed through
-    the function's param object.
+    Retrieve an order only when that order is authorized
+    for the current call session.
     """
+
+    verify_tool_secret(x_tool_secret)
+
+    verify_call_order_access(
+        call_id=call_id,
+        order_id=order_id,
+    )
 
     order = supabase_get_order(order_id)
 
@@ -178,18 +379,32 @@ def get_order_by_query(
             "pincode": order["pincode"],
             "landmark": order["landmark"],
             "delivery_notes": order["delivery_notes"],
+            "customer_confirmed": order.get("customer_confirmed"),
+            "address_verified": order.get("address_verified"),
             "verification_status": order["verification_status"],
         },
     }
 
 
-@app.get("/orders/{order_id}")
-def get_order(order_id: str):
-    """
-    Retrieve the order using the order ID in the URL path.
+# -------------------------------------------------------------------
+# Legacy/manual order endpoint
+# -------------------------------------------------------------------
 
-    Kept for existing API clients and manual testing.
+@app.get("/orders/{order_id}")
+def get_order(
+    order_id: str,
+    x_tool_secret: Optional[str] = Header(default=None),
+):
     """
+    Retrieve an order directly by ID.
+
+    This endpoint is retained for manual/backend testing.
+
+    The Bolna production tool should use /orders with call_id
+    so that the order is bound to the active call session.
+    """
+
+    verify_tool_secret(x_tool_secret)
 
     order = supabase_get_order(order_id)
 
@@ -205,6 +420,8 @@ def get_order(order_id: str):
             "pincode": order["pincode"],
             "landmark": order["landmark"],
             "delivery_notes": order["delivery_notes"],
+            "customer_confirmed": order.get("customer_confirmed"),
+            "address_verified": order.get("address_verified"),
             "verification_status": order["verification_status"],
         },
     }
@@ -215,13 +432,22 @@ def get_order(order_id: str):
 # -------------------------------------------------------------------
 
 @app.post("/validate-address")
-def validate_address(request: AddressValidationRequest):
+def validate_address(
+    request: AddressValidationRequest,
+    x_tool_secret: Optional[str] = Header(default=None),
+):
     """
     Validate a customer-provided address using OpenStreetMap Nominatim.
 
-    This verifies whether the address can be geographically resolved.
+    The service:
+    - checks whether the location can be geographically resolved
+    - restricts results to India
+    - checks an explicitly supplied pincode against the resolved pincode
+
     It does NOT guarantee courier deliverability.
     """
+
+    verify_tool_secret(x_tool_secret)
 
     address = request.address.strip()
 
@@ -265,11 +491,57 @@ def validate_address(request: AddressValidationRequest):
         return {
             "success": True,
             "valid": False,
-            "message": "The supplied address could not be geographically verified.",
+            "reason": "LOCATION_NOT_FOUND",
+            "message": (
+                "The supplied address could not be geographically verified."
+            ),
         }
 
     best = results[0]
     address_data = best.get("address", {})
+
+    # ---------------------------------------------------------------
+    # Country restriction
+    # ---------------------------------------------------------------
+
+    country_code = (
+        address_data.get("country_code") or ""
+    ).lower()
+
+    if country_code != "in":
+        return {
+            "success": True,
+            "valid": False,
+            "reason": "OUTSIDE_SERVICE_AREA",
+            "message": (
+                "The supplied location is outside the supported "
+                "delivery country."
+            ),
+            "country": address_data.get("country"),
+        }
+
+    verified_pincode = address_data.get("postcode")
+
+    # ---------------------------------------------------------------
+    # Pincode consistency check
+    # ---------------------------------------------------------------
+
+    if request.pincode and verified_pincode:
+        supplied_pincode = request.pincode.strip()
+
+        if supplied_pincode != verified_pincode:
+            return {
+                "success": True,
+                "valid": False,
+                "reason": "PINCODE_MISMATCH",
+                "message": (
+                    "The supplied pincode does not match the "
+                    "geographically resolved location."
+                ),
+                "provided_pincode": supplied_pincode,
+                "verified_pincode": verified_pincode,
+                "formatted_address": best.get("display_name"),
+            }
 
     return {
         "success": True,
@@ -284,8 +556,9 @@ def validate_address(request: AddressValidationRequest):
             or address_data.get("village")
         ),
         "state": address_data.get("state"),
-        "pincode": address_data.get("postcode"),
+        "pincode": verified_pincode,
         "country": address_data.get("country"),
+        "country_code": country_code,
         "match_type": best.get("type"),
     }
 
@@ -298,10 +571,41 @@ def validate_address(request: AddressValidationRequest):
 def update_order_verification(
     order_id: str,
     request: OrderVerificationUpdate,
+    call_id: str = Query(
+        ...,
+        description="The server-side call session identifier.",
+    ),
+    x_tool_secret: Optional[str] = Header(default=None),
 ):
     """
-    Update the verified customer/address information after the call.
+    Update only customer verification and delivery-address fields.
+
+    The requested order must belong to the active call session.
+
+    Immutable fields such as:
+    - product
+    - amount
+    - payment method
+    - customer name
+    - phone number
+
+    cannot be changed through this endpoint.
     """
+
+    verify_tool_secret(x_tool_secret)
+
+    # ---------------------------------------------------------------
+    # Call → order authorization
+    # ---------------------------------------------------------------
+
+    verify_call_order_access(
+        call_id=call_id,
+        order_id=order_id,
+    )
+
+    # ---------------------------------------------------------------
+    # Allowed statuses
+    # ---------------------------------------------------------------
 
     allowed_statuses = {
         "PENDING",
@@ -312,8 +616,14 @@ def update_order_verification(
 
     payload = request.model_dump(exclude_none=True)
 
+    # ---------------------------------------------------------------
+    # Verification status validation
+    # ---------------------------------------------------------------
+
     if "verification_status" in payload:
-        if payload["verification_status"] not in allowed_statuses:
+        status = payload["verification_status"]
+
+        if status not in allowed_statuses:
             raise HTTPException(
                 status_code=400,
                 detail=(
@@ -321,8 +631,120 @@ def update_order_verification(
                     "PENDING, VERIFIED, HOLD, CANCELLED"
                 ),
             )
+    else:
+        status = None
 
-    updated = supabase_update_order(order_id, payload)
+    customer_confirmed = payload.get("customer_confirmed")
+    address_verified = payload.get("address_verified")
+    address = payload.get("address")
+
+    # ---------------------------------------------------------------
+    # VERIFIED requires explicit customer + address confirmation
+    # ---------------------------------------------------------------
+
+    if status == "VERIFIED":
+
+        if customer_confirmed is not True:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "An order cannot be VERIFIED without "
+                    "explicit customer confirmation."
+                ),
+            )
+
+        if address_verified is not True:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "An order cannot be VERIFIED without "
+                    "address verification."
+                ),
+            )
+
+        if not address or not address.strip():
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "A VERIFIED order must contain a delivery address."
+                ),
+            )
+
+    # ---------------------------------------------------------------
+    # CANCELLED requires explicit rejection
+    # ---------------------------------------------------------------
+
+    if status == "CANCELLED":
+
+        if customer_confirmed is not False:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "A CANCELLED order must have "
+                    "customer_confirmed=false."
+                ),
+            )
+
+    # ---------------------------------------------------------------
+    # HOLD cannot claim successful verification
+    # ---------------------------------------------------------------
+
+    if status == "HOLD":
+
+        if customer_confirmed is True and address_verified is True:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "Use VERIFIED when both customer and "
+                    "address have been explicitly confirmed."
+                ),
+            )
+
+    # ---------------------------------------------------------------
+    # Explicit update allowlist
+    #
+    # Pydantic extra="forbid" already rejects unknown fields.
+    # This second allowlist makes the database boundary explicit.
+    # ---------------------------------------------------------------
+
+    allowed_fields = {
+        "customer_confirmed",
+        "address_verified",
+        "address",
+        "pincode",
+        "landmark",
+        "delivery_notes",
+        "verification_status",
+    }
+
+    unexpected_fields = set(payload.keys()) - allowed_fields
+
+    if unexpected_fields:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "message": (
+                    "Attempted to update immutable or "
+                    "unsupported fields."
+                ),
+                "fields": sorted(unexpected_fields),
+            },
+        )
+
+    payload = {
+        key: value
+        for key, value in payload.items()
+        if key in allowed_fields
+    }
+
+    # ---------------------------------------------------------------
+    # Perform database update
+    # ---------------------------------------------------------------
+
+    updated = supabase_update_order(
+        order_id,
+        payload,
+    )
 
     return {
         "success": True,
