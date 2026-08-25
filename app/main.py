@@ -203,13 +203,75 @@ def supabase_create_call_session(call_id: str, order_id: str):
     return rows[0]
 
 
+def ensure_call_session(call_id: str, order_id: str):
+    """
+    Idempotently establish the call -> order binding.
+
+    If a session already exists for this call, it may only refer to
+    the same order. A call can never be rebound to a different order.
+    """
+
+    try:
+        existing = supabase_get_call_session(call_id)
+    except HTTPException as exc:
+        if exc.status_code != 404:
+            raise
+        return supabase_create_call_session(call_id, order_id)
+
+    if existing["order_id"] != order_id:
+        raise HTTPException(
+            status_code=403,
+            detail="This call session is already bound to a different order.",
+        )
+
+    if existing["status"] != "ACTIVE":
+        raise HTTPException(
+            status_code=403,
+            detail="This call session is no longer active.",
+        )
+
+    expires_at = existing.get("expires_at")
+    if expires_at:
+        try:
+            expires = datetime.fromisoformat(
+                expires_at.replace("Z", "+00:00")
+            )
+            if expires <= datetime.now(timezone.utc):
+                raise HTTPException(
+                    status_code=403,
+                    detail="This call session has expired.",
+                )
+        except ValueError:
+            raise HTTPException(
+                status_code=500,
+                detail="Invalid call session expiration timestamp.",
+            )
+
+    return existing
+
+
 def verify_call_order_access(call_id: str, order_id: str):
     """
     Verify that the requested order belongs to the active,
     non-expired call session.
+
+    The Bolna pre-call webhook is fire-and-forget, so it can arrive
+    slightly after the main function request. We therefore retry the
+    session lookup briefly rather than failing on a normal race.
     """
 
-    session = supabase_get_call_session(call_id)
+    session = None
+
+    for attempt in range(5):
+        try:
+            session = supabase_get_call_session(call_id)
+            break
+        except HTTPException as exc:
+            if exc.status_code != 404 or attempt == 4:
+                raise
+
+            import time
+            time.sleep(0.25)
 
     if session["status"] != "ACTIVE":
         raise HTTPException(
@@ -297,6 +359,73 @@ def health():
 
 
 # -------------------------------------------------------------------
+# Bolna pre-call webhook: establish call -> order binding
+# -------------------------------------------------------------------
+
+@app.post("/webhooks/bolna-pre-call")
+def bolna_pre_call_webhook(payload: dict):
+    """
+    Receive Bolna's pre-call webhook for get_order_details.
+
+    Bolna sends the normal execution record plus the fields configured
+    in pre_call_webhook_param. For this agent, that extra field is
+    order_id.
+
+    The endpoint is intentionally idempotent:
+    - first request creates call_id -> order_id
+    - repeated requests for the same pair are harmless
+    - a call can never be rebound to another order
+
+    This endpoint does not require X-Tool-Secret because Bolna's
+    pre-call webhook configuration does not use the custom tool
+    authentication header. The actual order-reading and write
+    endpoints remain protected by X-Tool-Secret.
+    """
+
+    # In Bolna execution records, the execution/call identifier may
+    # appear as call_id or id depending on the payload surface.
+    call_id = (
+        payload.get("call_id")
+        or payload.get("execution_id")
+        or payload.get("id")
+    )
+
+    order_id = payload.get("order_id")
+
+    if not call_id:
+        raise HTTPException(
+            status_code=400,
+            detail="Missing call_id/execution id in Bolna pre-call payload.",
+        )
+
+    if not order_id:
+        raise HTTPException(
+            status_code=400,
+            detail="Missing order_id in Bolna pre-call payload.",
+        )
+
+    # Confirm that the target order actually exists before binding
+    # a live call to it.
+    supabase_get_order(order_id)
+
+    session = ensure_call_session(
+        call_id=str(call_id),
+        order_id=str(order_id),
+    )
+
+    return {
+        "success": True,
+        "session": {
+            "call_id": session["call_id"],
+            "order_id": session["order_id"],
+            "status": session["status"],
+            "created_at": session.get("created_at"),
+            "expires_at": session.get("expires_at"),
+        },
+    }
+
+
+# -------------------------------------------------------------------
 # Tool 0: Create call session
 # -------------------------------------------------------------------
 
@@ -326,7 +455,7 @@ def create_call_session(
     # Confirm that the order exists before creating the binding.
     supabase_get_order(order_id)
 
-    session = supabase_create_call_session(
+    session = ensure_call_session(
         call_id=call_id,
         order_id=order_id,
     )
@@ -760,3 +889,4 @@ def update_order_verification(
             "verification_status": updated["verification_status"],
         },
     }
+
