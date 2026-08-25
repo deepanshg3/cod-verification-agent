@@ -233,8 +233,9 @@ def ensure_call_session(call_id: str, order_id: str):
     expires_at = existing.get("expires_at")
     if expires_at:
         try:
-            expires = datetime.fromisoformat(
-                expires_at.replace("Z", "+00:00")
+            expires = datetime.strptime(
+                expires_at,
+                "%Y-%m-%dT%H:%M:%S.%f%z",
             )
             if expires <= datetime.now(timezone.utc):
                 raise HTTPException(
@@ -283,8 +284,9 @@ def verify_call_order_access(call_id: str, order_id: str):
 
     if expires_at:
         try:
-            expires = datetime.fromisoformat(
-                expires_at.replace("Z", "+00:00")
+            expires = datetime.strptime(
+                expires_at,
+                "%Y-%m-%dT%H:%M:%S.%f%z",
             )
 
             if expires <= datetime.now(timezone.utc):
@@ -696,14 +698,11 @@ def validate_address(
 # Tool 3: Update order verification
 # -------------------------------------------------------------------
 
-@app.post("/orders/{order_id}/verification")
+@app.post("/orders/{order_id}/verification/{call_id}")
 def update_order_verification(
     order_id: str,
+    call_id: str,
     request: OrderVerificationUpdate,
-    call_id: str = Query(
-        ...,
-        description="The server-side call session identifier.",
-    ),
     x_tool_secret: Optional[str] = Header(default=None),
 ):
     """
