@@ -702,11 +702,11 @@ def validate_address(
 # Tool 3: Update order verification
 # -------------------------------------------------------------------
 
-@app.post("/orders/{order_id}/verification/{call_id}")
+@app.post("/orders/{order_id}/verification")
 def update_order_verification(
     order_id: str,
-    call_id: str,
     request: OrderVerificationUpdate,
+    call_id: str = Query(...),
     x_tool_secret: Optional[str] = Header(default=None),
 ):
     """
